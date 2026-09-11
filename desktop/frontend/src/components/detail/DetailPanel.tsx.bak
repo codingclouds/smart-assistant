@@ -1,0 +1,1012 @@
+import type { DetailTab } from '../../lib/store';
+
+interface DetailPanelProps {
+  width: number;
+  activeTab: DetailTab;
+  onTabChange: (tab: DetailTab) => void;
+  onCollapse: () => void;
+}
+
+const TABS: { id: DetailTab; label: string; icon: string }[] = [
+  { id: 'trace', label: '执行链路', icon: '🔍' },
+  { id: 'files', label: '项目文件', icon: '📁' },
+  { id: 'memory', label: '记忆', icon: '🧠' },
+  { id: 'token', label: 'Token', icon: '⚡' },
+];
+
+export default function DetailPanel({ width, activeTab, onTabChange, onCollapse }: DetailPanelProps) {
+  return (
+    <aside
+      className="detail-panel flex flex-col h-full border-l"
+      style={{
+        width,
+        minWidth: width,
+        maxWidth: width,
+        background: 'var(--color-bg-secondary)',
+        borderColor: 'var(--color-border)',
+      }}
+    >
+      {/* Tab 栏 */}
+      <div
+        className="detail-panel__tabs flex items-center border-b"
+        style={{ borderColor: 'var(--color-border)', flexShrink: 0 }}
+      >
+        <div className="flex-1 flex items-center">
+          {TABS.map((tab) => {
+            const isActive = tab.id === activeTab;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => onTabChange(tab.id)}
+                className="detail-panel__tab"
+                style={{
+                  color: isActive ? 'var(--color-text-primary)' : 'var(--color-text-muted)',
+                  borderBottom: isActive
+                    ? '2px solid var(--color-accent)'
+                    : '2px solid transparent',
+                  fontWeight: isActive ? 600 : 400,
+                }}
+              >
+                <span className="detail-panel__tab-icon">{tab.icon}</span>
+                <span className="detail-panel__tab-label">{tab.label}</span>
+              </button>
+            );
+          })}
+        </div>
+        <button
+          onClick={onCollapse}
+          className="detail-panel__collapse-btn"
+          title="收起详情面板"
+        >
+          <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+            <path
+              d="M9 3L5 7L9 11"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+      </div>
+
+      {/* Tab 内容 */}
+      <div className="detail-panel__content flex-1 overflow-hidden">
+        {activeTab === 'trace' && <TraceTab />}
+        {activeTab === 'files' && <FilesTab />}
+        {activeTab === 'memory' && <MemoryTab />}
+        {activeTab === 'token' && <TokenTab />}
+      </div>
+    </aside>
+  );
+}
+
+// ===== TraceTab =====
+import { useState, useEffect, useRef, useCallback } from 'react';
+import { fetchTraces, type TraceEvent } from '../../lib/api';
+import { useSessionStore, useChatUIStore } from '../../lib/store';
+
+const EVENT_STYLE: Record<string, { label: string; color: string; bg: string }> = {
+  tool_call: { label: '工具调用', color: '#7c8aff', bg: 'rgba(124,138,255,0.1)' },
+  tool_result: { label: '工具结果', color: '#22c55e', bg: 'rgba(34,197,94,0.1)' },
+  thought: { label: '思考', color: '#a78bfa', bg: 'rgba(167,139,250,0.1)' },
+  response: { label: '响应', color: '#4ade80', bg: 'rgba(74,222,128,0.1)' },
+  error: { label: '错误', color: '#f87171', bg: 'rgba(248,113,113,0.1)' },
+  token: { label: 'Token', color: '#fbbf24', bg: 'rgba(251,191,36,0.1)' },
+};
+
+function parsePayload(payload: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return null;
+  }
+}
+
+/** 将平铺事件列表转为树形结构（按 agent 分组） */
+interface TraceNode {
+  id: string;
+  event: TraceEvent;
+  children: TraceNode[];
+  depth: number;
+}
+
+function buildTraceTree(events: TraceEvent[]): TraceNode[] {
+  const roots: TraceNode[] = [];
+  const stack: TraceNode[] = [];
+
+  for (const evt of events) {
+    const node: TraceNode = { id: evt.id, event: evt, children: [], depth: stack.length };
+
+    // agent_start 推入栈，agent_end 弹出
+    if (evt.event_type === 'agent_start') {
+      if (stack.length === 0) {
+        roots.push(node);
+      } else {
+        stack[stack.length - 1].children.push(node);
+      }
+      stack.push(node);
+    } else if (evt.event_type === 'agent_end') {
+      if (stack.length > 0) stack.pop();
+      // agent_end 不作为独立节点，跳过
+      continue;
+    } else {
+      if (stack.length === 0) {
+        roots.push(node);
+      } else {
+        stack[stack.length - 1].children.push(node);
+      }
+    }
+  }
+
+  return roots;
+}
+
+function formatDuration(ms: number): string {
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`;
+  return `${ms}ms`;
+}
+
+function TraceTreeItem({
+  node,
+  defaultExpanded,
+}: {
+  node: TraceNode;
+  defaultExpanded: boolean;
+}) {
+  const [expanded, setExpanded] = useState(defaultExpanded);
+  const style = EVENT_STYLE[node.event.event_type] || EVENT_STYLE.thought;
+  const payload = parsePayload(node.event.payload);
+  const hasChildren = node.children.length > 0;
+
+  const isAgentStart = node.event.event_type === 'agent_start';
+  const agentName = isAgentStart && payload ? String(payload.agent || payload.name || 'Agent') : null;
+
+  return (
+    <div className="trace-tree-item">
+      <div
+        className="trace-tree-item__row"
+        onClick={() => (hasChildren || payload) && setExpanded(!expanded)}
+        style={{ paddingLeft: node.depth * 16 + 8 }}
+      >
+        {/* 展开/折叠箭头 */}
+        <span className="trace-tree-item__arrow" style={{ visibility: hasChildren || payload ? 'visible' : 'hidden' }}>
+          <svg
+            width="10" height="10" viewBox="0 0 10 10"
+            style={{ transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)', transition: 'transform 0.15s' }}
+          >
+            <path d="M3.5 2L7 5L3.5 8" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </span>
+
+        {/* 状态点 */}
+        <div
+          className="trace-tree-item__dot"
+          style={{ background: style.color, opacity: node.event.event_type === 'error' ? 1 : 0.8 }}
+        />
+
+        {/* 标签 */}
+        <span
+          className="trace-tree-item__tag"
+          style={{ background: style.bg, color: style.color }}
+        >
+          {agentName || style.label}
+        </span>
+
+        {/* 摘要 */}
+        <span className="trace-tree-item__summary">
+          {agentName ? `Agent: ${agentName}` : node.event.event_type}
+        </span>
+
+        {/* 耗时 */}
+        {node.event.duration_ms > 0 && (
+          <span className="trace-tree-item__duration">
+            {formatDuration(node.event.duration_ms)}
+          </span>
+        )}
+      </div>
+
+      {/* 展开的载荷 */}
+      {expanded && payload && (
+        <div
+          className="trace-tree-item__payload"
+          style={{ marginLeft: node.depth * 16 + 32 }}
+        >
+          <pre>{JSON.stringify(payload, null, 2)}</pre>
+        </div>
+      )}
+
+      {/* 子节点 */}
+      {expanded &&
+        hasChildren &&
+        node.children.map((child) => (
+          <TraceTreeItem key={child.id} node={child} defaultExpanded={false} />
+        ))}
+    </div>
+  );
+}
+
+function TraceTab() {
+  const activeSessionId = useSessionStore((s) => s.activeSessionId);
+  const isStreaming = useChatUIStore((s) => s.isStreaming);
+  const [events, setEvents] = useState<TraceEvent[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const load = useCallback(() => {
+    if (!activeSessionId) {
+      setLoading(false);
+      setEvents([]);
+      return;
+    }
+    fetchTraces(activeSessionId)
+      .then((data) => {
+        setEvents(Array.isArray(data) ? data : []);
+        setError(null);
+      })
+      .catch((err) => setError(err.message || '加载 Trace 失败'))
+      .finally(() => setLoading(false));
+  }, [activeSessionId]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // 流式输出期间自动轮询
+  useEffect(() => {
+    if (isStreaming && activeSessionId) {
+      pollRef.current = setInterval(load, 1500);
+    } else {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      // streaming 结束后再拉一次最终数据
+      if (!isStreaming && activeSessionId) load();
+    }
+    return () => {
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [isStreaming, activeSessionId, load]);
+
+  const tree = buildTraceTree(events);
+
+  return (
+    <div className="trace-tab h-full flex flex-col">
+      {/* 状态栏 */}
+      <div
+        className="trace-tab__status flex items-center justify-between px-3 py-2 text-xs border-b"
+        style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+      >
+        <span>
+          {events.length} 个事件
+          {isStreaming && (
+            <span style={{ color: 'var(--color-accent)', marginLeft: 8 }}>
+              ● 实时
+            </span>
+          )}
+        </span>
+        <button
+          onClick={load}
+          className="trace-tab__refresh-btn"
+          title="刷新"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+            <path
+              d="M2 6a4 4 0 0 1 6.83-2.83M10 6a4 4 0 0 1-6.83 2.83M10 2v2.5H7.5M2 10V7.5h2.5"
+              stroke="currentColor"
+              strokeWidth="1.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </button>
+      </div>
+
+      {/* 树形内容 */}
+      <div className="trace-tab__tree flex-1 overflow-y-auto py-1">
+        {loading && (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-text-muted)' }}>
+            加载中...
+          </p>
+        )}
+
+        {error && (
+          <div className="text-center py-12 px-4">
+            <p className="text-xs mb-2" style={{ color: 'var(--color-error)' }}>{error}</p>
+            <button
+              onClick={load}
+              className="text-xs px-3 py-1 rounded-lg"
+              style={{ background: 'var(--color-accent-muted)', color: 'var(--color-accent)' }}
+            >
+              重试
+            </button>
+          </div>
+        )}
+
+        {!loading && !error && tree.length === 0 && (
+          <div className="text-center py-16">
+            <p className="text-2xl mb-2 opacity-40">🔍</p>
+            <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>
+              暂无 Trace 记录
+            </p>
+            <p className="text-[11px] mt-1" style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>
+              发送消息后将在此显示执行链路
+            </p>
+          </div>
+        )}
+
+        {!loading && !error && tree.map((node) => (
+          <TraceTreeItem key={node.id} node={node} defaultExpanded={true} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ===== FilesTab =====
+import { getFiles, getFileContent, getFilePreview, downloadFile, type WorkspaceFile, type FileContent, type FilePreview } from '../../lib/api';
+import { useWorkspaceStore, useLayoutStore } from '../../lib/store';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
+import { oneDark } from 'react-syntax-highlighter/dist/esm/styles/prism';
+import {
+  FileText, FileSpreadsheet, Presentation, FileCode, FileImage,
+  FileArchive, FileJson, File, FileLock,
+  Database, Globe, Palette, Settings, Terminal,
+} from 'lucide-react';
+
+/** 判断是否为图片扩展名 */
+function isImageExt(name: string): boolean {
+  const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+  return ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp', '.ico', '.bmp'].includes(ext);
+}
+
+/** 判断是否为可预览的文本类型 */
+function isPreviewableText(name: string): boolean {
+  const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+  const codeExts = ['.ts', '.tsx', '.js', '.jsx', '.go', '.py', '.java', '.rs', '.c', '.cpp', '.h', '.rb', '.php', '.swift', '.kt', '.scala', '.sh', '.bash', '.zsh', '.fish'];
+  const textExts = ['.txt', '.log', '.md', '.markdown', '.json', '.xml', '.yml', '.yaml', '.toml', '.ini', '.cfg', '.conf', '.env', '.css', '.scss', '.less', '.html', '.htm', '.csv', '.sql', '.graphql', '.proto'];
+  return codeExts.includes(ext) || textExts.includes(ext);
+}
+
+/** 根据扩展名获取语言标识（用于代码高亮的 className） */
+function getCodeLanguage(name: string): string {
+  const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+  const map: Record<string, string> = {
+    '.ts': 'typescript', '.tsx': 'tsx', '.js': 'javascript', '.jsx': 'jsx',
+    '.go': 'go', '.py': 'python', '.java': 'java', '.rs': 'rust',
+    '.c': 'c', '.cpp': 'cpp', '.h': 'c', '.rb': 'ruby', '.php': 'php',
+    '.swift': 'swift', '.kt': 'kotlin', '.scala': 'scala',
+    '.sh': 'bash', '.bash': 'bash', '.zsh': 'bash',
+    '.json': 'json', '.xml': 'xml', '.yml': 'yaml', '.yaml': 'yaml',
+    '.toml': 'toml', '.css': 'css', '.scss': 'scss', '.html': 'html',
+    '.sql': 'sql', '.graphql': 'graphql',
+  };
+  return map[ext] || 'text';
+}
+
+/** 判断是否为 Office 文档格式（可通过服务端转换为 HTML 预览） */
+function isOfficeDoc(name: string): boolean {
+  const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+  return ['.docx', '.xlsx', '.pptx', '.odt', '.ods', '.odp'].includes(ext);
+}
+
+function FilesTab() {
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
+  const previewFile = useLayoutStore((s) => s.previewFile);
+  const setPreviewFile = useLayoutStore((s) => s.setPreviewFile);
+  const [files, setFiles] = useState<WorkspaceFile[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // 预览状态
+  const [previewContent, setPreviewContent] = useState<FileContent | null>(null);
+  const [previewOffice, setPreviewOffice] = useState<FilePreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setLoading(true);
+    getFiles(activeWorkspaceId)
+      .then((data) => {
+        setFiles(Array.isArray(data) ? data : []);
+        setLoading(false);
+      })
+      .catch((err) => {
+        setError(err.message || '加载失败');
+        setLoading(false);
+      });
+  }, [activeWorkspaceId]);
+
+  // 响应外部预览请求（从聊天中的 file_artifact 卡片触发）
+  useEffect(() => {
+    if (!previewFile || previewFile.workspaceId !== activeWorkspaceId) return;
+    handlePreview(previewFile.workspaceId, previewFile.filePath, previewFile.fileName);
+  }, [previewFile?.filePath, previewFile?.workspaceId]);
+
+  const handlePreview = async (workspaceId: string, filePath: string, fileName: string) => {
+    setPreviewContent(null);
+    setPreviewOffice(null);
+    setPreviewError(null);
+    setPreviewLoading(true);
+    try {
+      // Office 文档 → 服务端 Python HTML 转换
+      if (isOfficeDoc(fileName)) {
+        const preview = await getFilePreview(workspaceId, filePath);
+        setPreviewOffice(preview);
+      } else {
+        // 文本/图片文件：直接获取内容
+        const content = await getFileContent(workspaceId, filePath);
+        setPreviewContent(content);
+      }
+    } catch (err) {
+      setPreviewError((err as Error).message || '加载文件失败');
+    } finally {
+      setPreviewLoading(false);
+    }
+  };
+
+  const handleClosePreview = () => {
+    setPreviewContent(null);
+    setPreviewOffice(null);
+    setPreviewError(null);
+    setPreviewFile(null);
+  };
+
+  // ===== 文件类型 → 颜色 =====
+  const fileColors: Record<string, string> = {
+    code: '#569cd6',
+    script: '#d4d47c',
+    markup: '#d77b47',
+    style: '#4ec9b0',
+    config: '#ce9178',
+    text: '#9d9ea4',
+    image: '#6a9955',
+    data: '#d4d47c',
+    archive: '#ce9178',
+    doc: '#2b579a',
+    sheet: '#217346',
+    slide: '#d24726',
+    pdf: '#ef4444',
+    lock: '#f59e0b',
+  };
+
+  type FileCategory = 'code' | 'script' | 'markup' | 'style' | 'config' | 'text' | 'image' | 'data' | 'archive' | 'doc' | 'sheet' | 'slide' | 'pdf' | 'lock';
+
+  function classifyFile(name: string): { category: FileCategory; Icon: typeof File; color: string } {
+    const ext = name.slice(name.lastIndexOf('.')).toLowerCase();
+    // Code files
+    if (['.ts', '.tsx', '.js', '.jsx', '.go', '.rs', '.c', '.cpp', '.h', '.hpp', '.java', '.kt', '.swift', '.scala', '.rb', '.php'].includes(ext))
+      return { category: 'code', Icon: FileCode, color: fileColors.code };
+    // Scripts
+    if (['.py', '.sh', '.bash', '.zsh', '.fish', '.ps1', '.bat', '.cmd'].includes(ext))
+      return { category: 'script', Icon: Terminal, color: fileColors.script };
+    // Markup
+    if (['.html', '.htm', '.xml', '.svg', '.mdx'].includes(ext))
+      return { category: 'markup', Icon: Globe, color: fileColors.markup };
+    // Styles
+    if (['.css', '.scss', '.less', '.sass'].includes(ext))
+      return { category: 'style', Icon: Palette, color: fileColors.style };
+    // Config
+    if (ext === '.json')
+      return { category: 'config', Icon: FileJson, color: fileColors.config };
+    if (['.yml', '.yaml', '.toml', '.ini', '.cfg', '.conf'].includes(ext))
+      return { category: 'config', Icon: Settings, color: fileColors.config };
+    // Images
+    if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.bmp', '.avif'].includes(ext))
+      return { category: 'image', Icon: FileImage, color: fileColors.image };
+    // Data
+    if (['.csv', '.sql', '.sqlite', '.db', '.graphql', '.proto'].includes(ext))
+      return { category: 'data', Icon: Database, color: fileColors.data };
+    // Archives
+    if (['.zip', '.tar', '.gz', '.tgz', '.rar', '.7z', '.bz2', '.xz'].includes(ext))
+      return { category: 'archive', Icon: FileArchive, color: fileColors.archive };
+    // Office documents
+    if (['.docx', '.doc', '.odt'].includes(ext))
+      return { category: 'doc', Icon: FileText, color: fileColors.doc };
+    if (['.xlsx', '.xls', '.ods'].includes(ext))
+      return { category: 'sheet', Icon: FileSpreadsheet, color: fileColors.sheet };
+    if (['.pptx', '.ppt', '.odp'].includes(ext))
+      return { category: 'slide', Icon: Presentation, color: fileColors.slide };
+    // PDF
+    if (['.pdf'].includes(ext))
+      return { category: 'pdf', Icon: FileText, color: fileColors.pdf };
+    // Lock/secure files
+    if (['.env', '.pem', '.key', '.cert', '.crt'].includes(ext))
+      return { category: 'lock', Icon: FileLock, color: fileColors.lock };
+    // Markdown (text)
+    if (['.md', '.markdown', '.txt', '.log'].includes(ext))
+      return { category: 'text', Icon: FileText, color: fileColors.text };
+    // Default
+    return { category: 'text', Icon: File, color: fileColors.text };
+  }
+
+  /** FileIcon 组件 — 使用 lucide-react 图标替代 emoji */
+  function FileIcon({ name, size = 14 }: { name: string; size?: number }) {
+    const { Icon, color } = classifyFile(name);
+    return <Icon size={size} color={color} strokeWidth={1.8} style={{ flexShrink: 0 }} />;
+  }
+
+  // ===== 预览视图 =====
+  const activePreview = previewContent || previewOffice;
+  if (activePreview) {
+    const fileName = activePreview.file_name;
+    const filePath = activePreview.file_path;
+    const workspaceId = activePreview.workspace_id;
+
+    // Office 文档预览（docx/xlsx/pptx 等服务端 Python HTML 转换）
+    if (previewOffice) {
+      return (
+        <div className="files-tab h-full flex flex-col">
+          <div
+            className="files-tab__header flex items-center gap-2 px-3 py-2 text-xs border-b"
+            style={{ borderColor: 'var(--color-border)' }}
+          >
+            <button
+              onClick={handleClosePreview}
+              className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-black/5 transition-all"
+              style={{ color: 'var(--color-text-muted)' }}
+              title="返回文件列表"
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M7.5 3L4.5 6L7.5 9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+              返回
+            </button>
+            <span className="flex-1 truncate font-medium" style={{ color: 'var(--color-text-primary)' }} title={filePath}>
+              <FileIcon name={fileName} /> {fileName}
+            </span>
+            <a
+              href="#" onClick={(e) => { e.preventDefault(); downloadFile(workspaceId, filePath, fileName); }}
+              download={fileName}
+              className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg transition-all hover:brightness-110"
+              style={{ background: 'var(--color-accent)', color: '#fff', textDecoration: 'none' }}
+            >
+              <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                <path d="M6 1v6M2.5 5L6 8.5 9.5 5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+                <path d="M1 9.5V11a1 1 0 001 1h8a1 1 0 001-1V9.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+              </svg>
+              下载
+            </a>
+          </div>
+          <div className="flex-1 overflow-auto">
+            {previewOffice.preview_available ? (
+              <div
+                className="office-preview px-4 py-3"
+                style={{ fontSize: 13, lineHeight: 1.7, color: 'var(--color-text-primary)' }}
+                dangerouslySetInnerHTML={{ __html: previewOffice.preview_html }}
+              />
+            ) : (
+              <div className="text-center py-16 px-4">
+                <p className="text-3xl mb-3 opacity-50"><FileIcon name={fileName} size={32} /></p>
+                <p className="text-sm font-medium mb-1" style={{ color: 'var(--color-text-primary)' }}>{fileName}</p>
+                <p className="text-xs mb-2" style={{ color: 'var(--color-text-muted)' }}>
+                  {previewOffice.preview_error || '暂不支持预览此类型文件'}
+                </p>
+                <a
+                  href="#" onClick={(e) => { e.preventDefault(); downloadFile(workspaceId, filePath, fileName); }}
+                  download={fileName}
+                  className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-lg transition-all hover:brightness-110"
+                  style={{ background: 'var(--color-accent)', color: '#fff', textDecoration: 'none' }}
+                >
+                  <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                    <path d="M7 1v8M3 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                    <path d="M1 10v2a1 1 0 001 1h10a1 1 0 001-1v-2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                  </svg>
+                  下载文件
+                </a>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    // 文本/图片文件预览
+    if (previewContent) {
+      const { content, content_type } = previewContent;
+      const isImage = content_type.startsWith('image/') || isImageExt(fileName);
+      const isMarkdown = fileName.endsWith('.md') || fileName.endsWith('.markdown');
+      const isText = isPreviewableText(fileName) || content_type.startsWith('text/');
+
+    return (
+      <div className="files-tab h-full flex flex-col">
+        {/* 预览标题栏 */}
+        <div
+          className="files-tab__header flex items-center gap-2 px-3 py-2 text-xs border-b"
+          style={{ borderColor: 'var(--color-border)' }}
+        >
+          <button
+            onClick={handleClosePreview}
+            className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-black/5 transition-all"
+            style={{ color: 'var(--color-text-muted)' }}
+            title="返回文件列表"
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M7.5 3L4.5 6L7.5 9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            返回
+          </button>
+          <span className="flex-1 truncate font-medium" style={{ color: 'var(--color-text-primary)' }} title={filePath}>
+            <FileIcon name={fileName} /> {fileName}
+          </span>
+          <a
+            href="#" onClick={(e) => { e.preventDefault(); downloadFile(workspaceId, filePath, fileName); }}
+            download={fileName}
+            className="flex items-center gap-1 text-xs px-2 py-1 rounded-lg transition-all hover:brightness-110"
+            style={{
+              background: 'var(--color-accent)',
+              color: '#fff',
+              textDecoration: 'none',
+            }}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M6 1v6M2.5 5L6 8.5 9.5 5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+              <path d="M1 9.5V11a1 1 0 001 1h8a1 1 0 001-1V9.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round"/>
+            </svg>
+            下载
+          </a>
+        </div>
+
+        {/* 预览内容 */}
+        <div className="flex-1 overflow-auto">
+          {isImage ? (
+            <div className="flex items-center justify-center p-4" style={{ minHeight: 200 }}>
+              <img
+                src={`data:${previewContent.content_type};base64,${previewContent.content}`}
+                alt={fileName}
+                style={{ maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', borderRadius: 8 }}
+              />
+            </div>
+          ) : isMarkdown ? (
+            <div className="markdown-body px-4 py-3" style={{ fontSize: 13 }}>
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                {content}
+              </ReactMarkdown>
+            </div>
+          ) : isText ? (
+            <SyntaxHighlighter
+              language={getCodeLanguage(fileName)}
+              style={oneDark}
+              customStyle={{
+                margin: 0,
+                padding: '16px',
+                fontSize: 12,
+                lineHeight: 1.65,
+                background: '#1a1b1e',
+                borderRadius: 0,
+                minHeight: '100%',
+              }}
+              showLineNumbers={content.split('\n').length > 3}
+              wrapLines={true}
+              wrapLongLines={false}
+            >
+              {content}
+            </SyntaxHighlighter>
+          ) : (
+            <div className="text-center py-16 px-4">
+              <p className="text-3xl mb-3 opacity-50"><FileIcon name={fileName} size={32} /></p>
+              <p className="text-sm font-medium mb-1" style={{ color: 'var(--color-text-primary)' }}>{fileName}</p>
+              <p className="text-xs mb-4" style={{ color: 'var(--color-text-muted)' }}>
+                {content_type} · 暂不支持预览此类型文件
+              </p>
+              <a
+                href="#" onClick={(e) => { e.preventDefault(); downloadFile(workspaceId, filePath, fileName); }}
+                download={fileName}
+                className="inline-flex items-center gap-1.5 text-xs px-4 py-2 rounded-lg transition-all hover:brightness-110"
+                style={{
+                  background: 'var(--color-accent)',
+                  color: '#fff',
+                  textDecoration: 'none',
+                }}
+              >
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+                  <path d="M7 1v8M3 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+                  <path d="M1 10v2a1 1 0 001 1h10a1 1 0 001-1v-2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/>
+                </svg>
+                下载文件
+              </a>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+    }
+
+    // 不应到达这里（activePreview 为真但既不是 previewContent 也不是 previewOffice）
+    return null;
+  }
+
+  // ===== 加载预览中 =====
+  if (previewLoading) {
+    return (
+      <div className="files-tab h-full flex flex-col">
+        <div className="files-tab__header flex items-center gap-2 px-3 py-2 text-xs border-b" style={{ borderColor: 'var(--color-border)' }}>
+          <button
+            onClick={handleClosePreview}
+            className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-black/5 transition-all"
+            style={{ color: 'var(--color-text-muted)' }}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M7.5 3L4.5 6L7.5 9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            返回
+          </button>
+          <span className="flex-1 text-xs" style={{ color: 'var(--color-text-muted)' }}>加载中...</span>
+        </div>
+        <div className="flex-1 flex items-center justify-center">
+          <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>正在加载文件内容...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // ===== 预览错误 =====
+  if (previewError) {
+    return (
+      <div className="files-tab h-full flex flex-col">
+        <div className="files-tab__header flex items-center gap-2 px-3 py-2 text-xs border-b" style={{ borderColor: 'var(--color-border)' }}>
+          <button
+            onClick={handleClosePreview}
+            className="flex items-center gap-1 text-xs px-1.5 py-0.5 rounded hover:bg-black/5 transition-all"
+            style={{ color: 'var(--color-text-muted)' }}
+          >
+            <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+              <path d="M7.5 3L4.5 6L7.5 9" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"/>
+            </svg>
+            返回
+          </button>
+          <span className="flex-1 text-xs" style={{ color: 'var(--color-error)' }}>加载失败</span>
+        </div>
+        <div className="flex-1 flex flex-col items-center justify-center p-4">
+          <p className="text-xs mb-3" style={{ color: 'var(--color-error)' }}>{previewError}</p>
+          <button
+            onClick={handleClosePreview}
+            className="text-xs px-3 py-1 rounded-lg transition-all hover:brightness-110"
+            style={{ background: 'var(--color-bg-hover)', color: 'var(--color-text-primary)', border: '1px solid var(--color-border)' }}
+          >
+            返回文件列表
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="files-tab h-full flex flex-col">
+      <div
+        className="files-tab__header flex items-center justify-between px-3 py-2 text-xs border-b"
+        style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+      >
+        <span>{files.length} 个文件</span>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {loading ? (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-text-muted)' }}>加载中...</p>
+        ) : error ? (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-error)' }}>{error}</p>
+        ) : files.length === 0 ? (
+          <div className="text-center py-16">
+            <p className="text-2xl mb-2 opacity-40">📁</p>
+            <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>暂无项目文件</p>
+          </div>
+        ) : (
+          <div className="files-tab__list">
+            {files.map((f) => (
+              <div
+                key={f.path}
+                className="files-tab__item"
+                onClick={() => handlePreview(activeWorkspaceId, f.path, f.path.split('/').pop() || f.path)}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    handlePreview(activeWorkspaceId, f.path, f.path.split('/').pop() || f.path);
+                  }
+                }}
+                title="点击预览文件"
+              >
+                <span className="files-tab__item-icon"><FileIcon name={f.path} /></span>
+                <div className="files-tab__item-info">
+                  <span className="files-tab__item-name">{f.path}</span>
+                  <span className="files-tab__item-meta">
+                    {f.size ? `${(f.size / 1024).toFixed(1)} KB` : ''}
+                    {f.modified_at ? ` · ${new Date(f.modified_at).toLocaleDateString()}` : ''}
+                  </span>
+                </div>
+                <span className="files-tab__item-preview-icon" style={{ opacity: 0.4, fontSize: 12 }}>
+                  <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                    <circle cx="6" cy="6" r="2" stroke="currentColor" strokeWidth="1"/>
+                    <path d="M1 6s2-4 5-4 5 4 5 4-2 4-5 4-5-4-5-4z" stroke="currentColor" strokeWidth="1"/>
+                  </svg>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===== MemoryTab =====
+import { fetchMemories, type MemoryFragment } from '../../lib/api';
+
+function MemoryTab() {
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
+  const [memories, setMemories] = useState<MemoryFragment[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    fetchMemories(activeWorkspaceId)
+      .then((data) => {
+        setMemories(Array.isArray(data) ? data : []);
+        setLoading(false);
+        setError(null);
+      })
+      .catch((err) => {
+        setError(err.message || '加载失败');
+        setLoading(false);
+      });
+  }, [activeWorkspaceId]);
+
+  const toggle = (id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  return (
+    <div className="memory-tab h-full flex flex-col">
+      <div
+        className="memory-tab__header flex items-center justify-between px-3 py-2 text-xs border-b"
+        style={{ borderColor: 'var(--color-border)', color: 'var(--color-text-muted)' }}
+      >
+        <span>{memories.length} 条记忆</span>
+      </div>
+      <div className="flex-1 overflow-y-auto">
+        {loading ? (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-text-muted)' }}>加载中...</p>
+        ) : error ? (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-error)' }}>{error}</p>
+        ) : memories.length === 0 ? (
+          <div className="text-center py-16">
+            <p className="text-2xl mb-2 opacity-40">🧠</p>
+            <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>暂无记忆片段</p>
+            <p className="text-[11px] mt-1" style={{ color: 'var(--color-text-muted)', opacity: 0.6 }}>
+              Agent 会从对话中自动抽取记忆
+            </p>
+          </div>
+        ) : (
+          <div className="memory-tab__list px-2 py-1">
+            {memories.map((m) => (
+              <div key={m.id} className="memory-tab__card">
+                <div
+                  className="memory-tab__card-header"
+                  onClick={() => toggle(m.id)}
+                >
+                  <span className="memory-tab__card-arrow" style={{ transform: expanded.has(m.id) ? 'rotate(90deg)' : undefined }}>
+                    ▶
+                  </span>
+                  <span className="memory-tab__card-title">{m.title || '未命名记忆'}</span>
+                  {m.category && (
+                    <span className="memory-tab__card-category">{m.category}</span>
+                  )}
+                </div>
+                {expanded.has(m.id) && (
+                  <div className="memory-tab__card-body">
+                    <p>{m.content}</p>
+                    {m.created_at && (
+                      <span className="memory-tab__card-date">
+                        {new Date(m.created_at).toLocaleString()}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ===== TokenTab =====
+import { fetchTokenStats, type TokenStats } from '../../lib/api';
+
+function TokenTab() {
+  const [stats, setStats] = useState<TokenStats[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchTokenStats()
+      .then((data) => {
+        setStats(Array.isArray(data) ? data : []);
+        setLoading(false);
+        setError(null);
+      })
+      .catch((err) => {
+        setError(err.message || '加载失败');
+        setLoading(false);
+      });
+  }, []);
+
+  const totalInput = stats.reduce((s, x) => s + (x.prompt_tokens || 0), 0);
+  const totalOutput = stats.reduce((s, x) => s + (x.completion_tokens || 0), 0);
+  const totalTokens = totalInput + totalOutput;
+
+  function fmt(n: number): string {
+    if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+    if (n >= 1000) return `${(n / 1000).toFixed(1)}K`;
+    return String(n);
+  }
+
+  return (
+    <div className="token-tab h-full flex flex-col">
+      {/* 汇总 */}
+      <div className="token-tab__summary px-4 py-3 border-b" style={{ borderColor: 'var(--color-border)' }}>
+        <div className="token-tab__total">
+          <span className="token-tab__total-value">{fmt(totalTokens)}</span>
+          <span className="token-tab__total-label">总 Token 用量</span>
+        </div>
+        <div className="token-tab__breakdown">
+          <div className="token-tab__meter">
+            <div
+              className="token-tab__meter-bar"
+              style={{
+                width: totalTokens > 0 ? `${(totalInput / totalTokens) * 100}%` : '0%',
+                background: 'var(--color-accent)',
+              }}
+            />
+          </div>
+          <div className="token-tab__meter-labels">
+            <span>输入 {fmt(totalInput)}</span>
+            <span>输出 {fmt(totalOutput)}</span>
+          </div>
+        </div>
+      </div>
+
+      {/* 明细 */}
+      <div className="flex-1 overflow-y-auto">
+        {loading ? (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-text-muted)' }}>加载中...</p>
+        ) : error ? (
+          <p className="text-xs text-center py-12" style={{ color: 'var(--color-error)' }}>{error}</p>
+        ) : stats.length === 0 ? (
+          <div className="text-center py-16">
+            <p className="text-2xl mb-2 opacity-40">⚡</p>
+            <p className="text-xs" style={{ color: 'var(--color-text-muted)' }}>暂无用量数据</p>
+          </div>
+        ) : (
+          <div className="token-tab__table">
+            <div className="token-tab__table-header">
+              <span>模型</span>
+              <span>输入</span>
+              <span>输出</span>
+              <span>合计</span>
+            </div>
+            {stats.map((s, i) => (
+              <div key={i} className="token-tab__table-row">
+                <span className="token-tab__model">{s.model || '-'}</span>
+                <span>{fmt(s.prompt_tokens || 0)}</span>
+                <span>{fmt(s.completion_tokens || 0)}</span>
+                <span className="token-tab__total-col">{fmt(s.total_tokens || 0)}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}

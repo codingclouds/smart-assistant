@@ -1,0 +1,15 @@
+/* Wails window-drag support — keep minimal, real theming lives in globals.css */
+html, body { margin: 0; }
+
+body {
+  /* Drag the window by its background. Interactive controls opt out with
+     --wails-draggable: no-drag (the property inherits). */
+  --wails-draggable: drag;
+}
+
+/* Interactive elements are clickable, not draggable. */
+input, textarea, button, select, a, [role="button"] {
+  --wails-draggable: no-drag;
+  -webkit-user-select: text;
+  user-select: text;
+}

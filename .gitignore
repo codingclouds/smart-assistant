@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output
+desktop/frontend/dist/
+desktop/build/
+desktop/smart-assistant
+
+# Binaries (*)
+desktop/app
+desktop/desktop
+desktop/desktop-app
+desktop/desktop-build
+desktop/engine-build
+engine/bin/
+bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+*.db
+*.db-journal
+desktop/data/
+
+# Logs
+*.log
+
+# Env
+.env
+.env.local
