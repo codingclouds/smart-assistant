@@ -104,7 +104,7 @@ export default function MessageItem({ message, isStreaming, onPreviewOpen, onFil
               color: 'var(--color-user-bubble-text)',
             }}
           >
-            {message.content}
+            {message.content.trim()}
           </div>
           <div className="user-msg__actions">
             <button
