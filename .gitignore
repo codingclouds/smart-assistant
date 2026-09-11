@@ -13,6 +13,8 @@ desktop/desktop-app
 desktop/desktop-build
 desktop/engine-build
 engine/bin/
+engine/server
+engine/internal/agent/smart-assistant
 bin/
 
 # IDE
